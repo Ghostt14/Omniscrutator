@@ -1,20 +1,17 @@
 [package]
-name = "rovyl_search"
+name = "omniscrutator"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+
+[[bin]]
+name = "omniscrutator"
+path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.19", default-features = false, features = ["default_fonts", "glow"] }
-egui = "0.19"
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Pin `url`/`idna` down to versions that don't pull in the new icu_* crates
-# (which require edition2024). This sandbox's apt-packaged rustc (1.75) can't
-# build those. Harmless pin, not used directly by our code -- remove once
-# you're building with a current toolchain (1.80+) on your own machine.
-url = "=2.4.1"
-idna = "=0.4.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [

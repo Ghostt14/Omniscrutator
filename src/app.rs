@@ -1,14 +1,33 @@
-// The UI itself. One screen, two views: the search popup (default) and a
-// settings panel toggled with a gear button / Ctrl+,.
+// The UI itself. Two views: the search popup (default) and a settings panel.
+//
+// Changes from the first skeleton pass, per feedback:
+// - No visible filter tabs. Search is always "All"; what gets sorted to the
+//   front is a Settings-only preference (`ResultPriority`).
+// - No gear button / keyboard shortcut for Settings. It's opened by typing
+//   "settings" (shown as a command row, confirmed with Enter) or, as an
+//   interim stand-in for "right-click the tray icon" (no tray icon exists
+//   yet -- that's Win32-specific future work), right-clicking anywhere in
+//   the window.
+// - Quick math: if the query parses as an arithmetic expression, the
+//   answer is shown as the first row, ahead of any file results.
 
-use crate::everything::{EverythingBackend, FilterMode, MockBackend, SearchResult};
+use crate::everything::{EverythingBackend, MockBackend, SearchResult};
+use crate::mathexpr;
 use crate::settings::Settings;
 use eframe::egui;
 
-pub struct RovylApp {
+/// One row in the results list. Keeping this as an enum (rather than
+/// shoehorning everything into `SearchResult`) is what makes it easy to mix
+/// a math answer and a "Open Settings" command in with real file rows.
+enum Row {
+    Math(f64),
+    Command(&'static str), // label shown; only "Open Settings" exists today
+    File(SearchResult),
+}
+
+pub struct OmniscrutatorApp {
     query: String,
-    filter: FilterMode,
-    results: Vec<SearchResult>,
+    results: Vec<Row>,
     selected: usize,
     backend: Box<dyn EverythingBackend>,
     settings: Settings,
@@ -16,17 +35,15 @@ pub struct RovylApp {
     status_message: Option<String>,
 }
 
-impl RovylApp {
+impl OmniscrutatorApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        // TODO: once EverythingIpcBackend::search is actually wired up, pick it
-        // here on Windows (`#[cfg(windows)] Box::new(EverythingIpcBackend::default())`)
-        // and fall back to MockBackend elsewhere. Staying on Mock everywhere for now
-        // so the skeleton behaves identically regardless of platform.
+        // TODO: once EverythingIpcBackend::search is wired up, pick it here
+        // on Windows and fall back to MockBackend elsewhere. Staying on Mock
+        // everywhere for now so the skeleton behaves identically on any OS.
         let backend: Box<dyn EverythingBackend> = Box::new(MockBackend::default());
 
         let mut app = Self {
             query: String::new(),
-            filter: FilterMode::All,
             results: Vec::new(),
             selected: 0,
             backend,
@@ -39,9 +56,34 @@ impl RovylApp {
     }
 
     fn run_search(&mut self) {
-        let full_query = format!("{}{}", self.filter.query_prefix(), self.query);
-        self.results = self.backend.search(&full_query, self.settings.max_results);
         self.selected = 0;
+        let trimmed = self.query.trim();
+
+        // 1. Math takes priority over everything else, including the
+        // "open settings" command and any file search -- per spec, "4(5)-3"
+        // should show 17 first, full stop.
+        if let Some(value) = mathexpr::try_eval(trimmed) {
+            self.results = vec![Row::Math(value)];
+            return;
+        }
+
+        let mut rows = Vec::new();
+
+        // 2. The "settings" command. Exact match (case-insensitive) rather
+        // than a substring, so a real search for a file literally named
+        // "settings.ini" still works normally alongside it.
+        if trimmed.eq_ignore_ascii_case("settings") {
+            rows.push(Row::Command("Open Settings"));
+        }
+
+        // 3. Normal file search, always unfiltered ("All"), then re-ordered
+        // so matches of the user's chosen priority category come first.
+        let mut files = self.backend.search(trimmed, self.settings.max_results);
+        let priority = self.settings.result_priority;
+        files.sort_by_key(|r| if priority.matches(r) { 0 } else { 1 });
+        rows.extend(files.into_iter().map(Row::File));
+
+        self.results = rows;
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -53,16 +95,27 @@ impl RovylApp {
         self.selected = new as usize;
     }
 
-    fn open_selected(&mut self) {
-        if let Some(r) = self.results.get(self.selected) {
-            // TODO: ShellExecuteW(path) on Windows. Just reporting for now.
-            self.status_message = Some(format!("Would open: {}", r.full_path));
+    fn activate_selected(&mut self, ctx: &egui::Context) {
+        match self.results.get(self.selected) {
+            Some(Row::Math(value)) => {
+                ctx.copy_text(format!("{value}"));
+                self.status_message = Some(format!("Copied result: {value}"));
+            }
+            Some(Row::Command("Open Settings")) => {
+                self.show_settings = true;
+            }
+            Some(Row::Command(_)) => {}
+            Some(Row::File(r)) => {
+                // TODO: ShellExecuteW(path) on Windows. Just reporting for now.
+                self.status_message = Some(format!("Would open: {}", r.full_path));
+            }
+            None => {}
         }
     }
 
     fn copy_selected_path(&mut self, ctx: &egui::Context) {
-        if let Some(r) = self.results.get(self.selected) {
-            ctx.output().copied_text = r.full_path.clone();
+        if let Some(Row::File(r)) = self.results.get(self.selected) {
+            ctx.copy_text(r.full_path.clone());
             self.status_message = Some(format!("Copied path: {}", r.full_path));
         }
     }
@@ -70,24 +123,22 @@ impl RovylApp {
     fn is_web_search(&self) -> bool {
         !self.settings.web_search_prefix.is_empty()
             && self.query.starts_with(self.settings.web_search_prefix.as_str())
+            && mathexpr::try_eval(self.query.trim()).is_none()
     }
 }
 
-impl eframe::App for RovylApp {
+impl eframe::App for OmniscrutatorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Global key handling: arrows to move selection, Enter to open,
-        // Ctrl+Enter to copy path, Esc to quit. Settings is opened via the
-        // gear button for now; F2 toggles it too (Ctrl+, needs a key egui
-        // 0.19 doesn't expose -- add it back once we're on a newer egui).
-        let (esc, down, up, toggle_settings) = {
-            let input = ctx.input();
+        // Global key handling: arrows to move selection, Enter to activate,
+        // Ctrl+Enter to copy path, Esc to quit.
+        let (esc, down, up, right_click) = ctx.input(|i| {
             (
-                input.key_pressed(egui::Key::Escape),
-                input.key_pressed(egui::Key::ArrowDown),
-                input.key_pressed(egui::Key::ArrowUp),
-                input.key_pressed(egui::Key::F2),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.pointer.secondary_clicked(),
             )
-        };
+        });
         if esc {
             std::process::exit(0);
         }
@@ -97,8 +148,11 @@ impl eframe::App for RovylApp {
         if up {
             self.move_selection(-1);
         }
-        if toggle_settings {
-            self.show_settings = !self.show_settings;
+        if right_click {
+            // Interim stand-in for "right-click the tray icon" -- there's no
+            // tray icon yet (Win32-specific, future work), so right-clicking
+            // anywhere in the window opens Settings for now.
+            self.show_settings = true;
         }
 
         if self.show_settings {
@@ -111,32 +165,15 @@ impl eframe::App for RovylApp {
             ui.horizontal(|ui| {
                 ui.add_space(4.0);
                 let resp = ui.add_sized(
-                    [ui.available_width() - 40.0, 34.0],
+                    [ui.available_width() - 8.0, 34.0],
                     egui::TextEdit::singleline(&mut self.query)
-                        .hint_text("Search files, folders, apps... (? to web search)")
+                        .hint_text("Search files, folders, apps... try \"4(5)-3\" or \"settings\"")
                         .font(egui::TextStyle::Heading),
                 );
                 if resp.changed() {
                     self.run_search();
                 }
                 resp.request_focus();
-
-                if ui.add(egui::Button::new("\u{2699}")).clicked() {
-                    self.show_settings = true;
-                }
-            });
-            ui.add_space(4.0);
-
-            // Filter mode tabs.
-            ui.horizontal(|ui| {
-                ui.add_space(4.0);
-                for mode in FilterMode::ALL {
-                    let selected = self.filter == mode;
-                    if ui.selectable_label(selected, mode.label()).clicked() {
-                        self.filter = mode;
-                        self.run_search();
-                    }
-                }
             });
             ui.add_space(6.0);
         });
@@ -149,7 +186,7 @@ impl eframe::App for RovylApp {
                     if let Some(msg) = &self.status_message {
                         ui.label(msg);
                     } else {
-                        ui.weak(format!("{} results  |  Up/Down move  Enter open  Ctrl+Enter copy path", self.results.len()));
+                        ui.weak("Up/Down move  Enter activate  Ctrl+Enter copy path  right-click settings");
                     }
                 });
             });
@@ -167,28 +204,48 @@ impl eframe::App for RovylApp {
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for (i, r) in self.results.iter().enumerate() {
+                for i in 0..self.results.len() {
                     let selected = i == self.selected;
-                    // TODO: real icons (extracted .exe/.lnk icons, folder glyph) once
-                    // we're past the layout-skeleton phase; egui's default font has
-                    // no emoji glyphs, so plain bracketed text for now.
-                    let icon = if r.is_dir { "[DIR]" } else { "[FILE]" };
                     let frame = egui::Frame::none()
                         .fill(if selected {
                             ui.visuals().selection.bg_fill
                         } else {
                             egui::Color32::TRANSPARENT
                         })
-                        .inner_margin(egui::style::Margin::symmetric(8.0, 6.0));
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0));
                     frame.show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(icon);
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(&r.name).strong());
-                                ui.label(egui::RichText::new(&r.full_path).weak().small());
-                            });
-                        });
+                        match &self.results[i] {
+                            Row::Math(value) => {
+                                ui.horizontal(|ui| {
+                                    ui.label("[=]");
+                                    ui.label(
+                                        egui::RichText::new(format!("{value}"))
+                                            .strong()
+                                            .size(22.0),
+                                    );
+                                    ui.weak("Enter to copy");
+                                });
+                            }
+                            Row::Command(label) => {
+                                ui.horizontal(|ui| {
+                                    ui.label("[>]");
+                                    ui.label(egui::RichText::new(*label).strong());
+                                });
+                            }
+                            Row::File(r) => {
+                                // TODO: real icons once past the layout-skeleton phase;
+                                // egui's default font has no emoji glyphs.
+                                let icon = if r.is_dir { "[DIR]" } else { "[FILE]" };
+                                ui.horizontal(|ui| {
+                                    ui.label(icon);
+                                    ui.vertical(|ui| {
+                                        ui.label(egui::RichText::new(&r.name).strong());
+                                        ui.label(egui::RichText::new(&r.full_path).weak().small());
+                                    });
+                                });
+                            }
+                        }
                     });
                 }
                 if self.results.is_empty() {
@@ -198,12 +255,10 @@ impl eframe::App for RovylApp {
             });
         });
 
-        // Handle Enter / Ctrl+Enter after drawing.
-        let (enter, ctrl_enter) = {
-            let input = ctx.input();
-            let enter = input.key_pressed(egui::Key::Enter);
-            (enter, enter && input.modifiers.ctrl)
-        };
+        let (enter, ctrl_enter) = ctx.input(|i| {
+            let enter = i.key_pressed(egui::Key::Enter);
+            (enter, enter && i.modifiers.ctrl)
+        });
         if ctrl_enter {
             self.copy_selected_path(ctx);
         } else if enter {
@@ -212,17 +267,27 @@ impl eframe::App for RovylApp {
                 let url = self.settings.web_search_url.replace("{query}", &urlencoding_lite(term));
                 self.status_message = Some(format!("Would open browser at: {url}"));
             } else {
-                self.open_selected();
+                self.activate_selected(ctx);
             }
         }
     }
 }
 
-impl RovylApp {
+impl OmniscrutatorApp {
     fn settings_view(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Settings");
             ui.add_space(10.0);
+
+            ui.label("What should be sorted to the front of results?");
+            egui::ComboBox::from_id_salt("result_priority")
+                .selected_text(self.settings.result_priority.label())
+                .show_ui(ui, |ui| {
+                    for p in crate::everything::ResultPriority::ALL {
+                        ui.selectable_value(&mut self.settings.result_priority, p, p.label());
+                    }
+                });
+            ui.add_space(8.0);
 
             ui.label("Summon hotkey");
             ui.text_edit_singleline(&mut self.settings.hotkey);

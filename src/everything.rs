@@ -2,50 +2,57 @@
 // UI never knows whether it's getting real results from voidtools' Everything
 // or fake ones for layout testing.
 //
-// `MockBackend` is what we compile with on any OS (including this Linux
-// sandbox) so we can actually run and look at the UI. `EverythingBackend`'s
-// real implementation (IPC/FFI into Everything64.dll) is stubbed under
-// `#[cfg(windows)]` below -- it compiles but every call currently returns
-// "not wired up yet". That's the next step once the layout looks right.
+// `MockBackend` is what we compile with on any OS (including the Linux
+// sandbox this skeleton was first built in) so it can actually run and be
+// looked at. The real implementation (IPC/FFI into Everything64.dll) is
+// stubbed under `#[cfg(windows)]` below -- it compiles but returns nothing
+// yet. That's the next milestone.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FilterMode {
-    All,
+use serde::{Deserialize, Serialize};
+
+// Search is always unfiltered ("All") now -- per-type tabs were removed from
+// the main UI. `ResultPriority` instead lives in Settings and just re-orders
+// results: matches of the chosen category are stably sorted to the front,
+// everything else keeps its normal relevance order behind them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResultPriority {
+    General,
     Executables,
     Folders,
     Documents,
     Images,
 }
 
-impl FilterMode {
-    pub const ALL: [FilterMode; 5] = [
-        FilterMode::All,
-        FilterMode::Executables,
-        FilterMode::Folders,
-        FilterMode::Documents,
-        FilterMode::Images,
+impl ResultPriority {
+    pub const ALL: [ResultPriority; 5] = [
+        ResultPriority::General,
+        ResultPriority::Executables,
+        ResultPriority::Folders,
+        ResultPriority::Documents,
+        ResultPriority::Images,
     ];
 
     pub fn label(&self) -> &'static str {
         match self {
-            FilterMode::All => "All",
-            FilterMode::Executables => "Apps",
-            FilterMode::Folders => "Folders",
-            FilterMode::Documents => "Docs",
-            FilterMode::Images => "Images",
+            ResultPriority::General => "General (no re-ordering)",
+            ResultPriority::Executables => "Apps first",
+            ResultPriority::Folders => "Folders first",
+            ResultPriority::Documents => "Documents first",
+            ResultPriority::Images => "Images first",
         }
     }
 
-    // The actual Everything search-syntax fragment this mode prepends to the
-    // user's query, e.g. "ext:exe foo" -- Everything already understands this,
-    // we don't reimplement filtering, just build the right query string.
-    pub fn query_prefix(&self) -> &'static str {
+    /// Does this result belong to the category this priority boosts?
+    /// `General` boosts nothing -- natural relevance order is kept.
+    pub fn matches(&self, r: &SearchResult) -> bool {
+        let lower = r.name.to_lowercase();
+        let ends_with_any = |exts: &[&str]| exts.iter().any(|e| lower.ends_with(&format!(".{e}")));
         match self {
-            FilterMode::All => "",
-            FilterMode::Executables => "ext:exe;bat;cmd;lnk ",
-            FilterMode::Folders => "folder: ",
-            FilterMode::Documents => "ext:pdf;docx;doc;xlsx;pptx;txt;md ",
-            FilterMode::Images => "ext:png;jpg;jpeg;gif;webp;svg ",
+            ResultPriority::General => false,
+            ResultPriority::Executables => ends_with_any(&["exe", "bat", "cmd", "lnk"]),
+            ResultPriority::Folders => r.is_dir,
+            ResultPriority::Documents => ends_with_any(&["pdf", "docx", "doc", "xlsx", "pptx", "txt", "md"]),
+            ResultPriority::Images => ends_with_any(&["png", "jpg", "jpeg", "gif", "webp", "svg"]),
         }
     }
 }
@@ -58,9 +65,9 @@ pub struct SearchResult {
 }
 
 pub trait EverythingBackend {
-    /// Run a query (already including the filter prefix) and return results,
-    /// most-relevant first. Implementations should be fast enough to call on
-    /// every keystroke.
+    /// Run an unfiltered query and return results, most-relevant first.
+    /// Re-ordering by `ResultPriority` happens afterward, in the UI layer,
+    /// not here -- the backend's job is just "find matches of this text".
     fn search(&mut self, query: &str, max_results: usize) -> Vec<SearchResult>;
 
     /// Human-readable backend status shown in the UI's footer, e.g.
@@ -69,9 +76,9 @@ pub trait EverythingBackend {
 }
 
 // ---------------------------------------------------------------------
-// Mock backend -- fixed in-memory dataset, filtered by substring + the
-// query_prefix's extension list. Good enough to test scrolling, highlighting,
-// keyboard nav, and the filter tabs without touching Windows at all.
+// Mock backend -- fixed in-memory dataset, substring-filtered. Good enough
+// to test scrolling, highlighting, keyboard nav, sorting and the math/
+// settings command handling without touching Windows at all.
 // ---------------------------------------------------------------------
 pub struct MockBackend {
     data: Vec<SearchResult>,
@@ -108,31 +115,10 @@ impl Default for MockBackend {
 
 impl EverythingBackend for MockBackend {
     fn search(&mut self, query: &str, max_results: usize) -> Vec<SearchResult> {
-        // Very rough stand-in for Everything's own filtering: pull any
-        // "ext:a;b;c " prefix off the front, match the rest as a case-
-        // insensitive substring of the name.
-        let (ext_filter, text) = match query.split_once(' ') {
-            Some((prefix, rest)) if prefix.starts_with("ext:") || prefix.starts_with("folder:") => {
-                (Some(prefix), rest)
-            }
-            _ => (None, query),
-        };
-        let text = text.trim().to_lowercase();
-
+        let text = query.trim().to_lowercase();
         self.data
             .iter()
-            .filter(|r| {
-                let name_ok = text.is_empty() || r.name.to_lowercase().contains(&text);
-                let ext_ok = match ext_filter {
-                    None => true,
-                    Some(f) if f.starts_with("folder:") => r.is_dir,
-                    Some(f) => {
-                        let exts: Vec<&str> = f.trim_start_matches("ext:").split(';').collect();
-                        exts.iter().any(|e| r.name.to_lowercase().ends_with(&format!(".{e}")))
-                    }
-                };
-                name_ok && ext_ok
-            })
+            .filter(|r| text.is_empty() || r.name.to_lowercase().contains(&text))
             .take(max_results)
             .cloned()
             .collect()
@@ -145,10 +131,10 @@ impl EverythingBackend for MockBackend {
 
 // ---------------------------------------------------------------------
 // Real backend -- talks to Everything via its documented IPC window
-// (see voidtools' SDK: Everything_SetSearchW / Everything_QueryW via
+// (voidtools' SDK: Everything_SetSearchW / Everything_QueryW via
 // Everything64.dll, or the WM_COPYDATA IPC protocol if we skip the DLL).
-// Left unimplemented on purpose: this is the next milestone, once the UI
-// skeleton is approved. Only compiled on Windows.
+// Left unimplemented on purpose: next milestone, once the UI is approved.
+// Only compiled on Windows.
 // ---------------------------------------------------------------------
 #[cfg(windows)]
 pub struct EverythingIpcBackend {

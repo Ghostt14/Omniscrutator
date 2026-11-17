@@ -1,0 +1,34 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  # Fast sanity check on every push/PR: does it still compile cross-platform?
+  # MockBackend is used everywhere and the Windows-only FFI/IPC code is
+  # behind #[cfg(windows)], so this should pass on Linux too and catches
+  # most mistakes quicker than waiting on the Windows job below.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --verbose
+      - run: cargo test --verbose
+
+  # The real target: a native Windows build, since this app depends on
+  # Win32 APIs (via windows-sys) once the real Everything IPC backend and
+  # global hotkey are wired in.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --verbose
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omniscrutator-windows
+          path: target/release/omniscrutator.exe
